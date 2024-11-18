@@ -150,9 +150,9 @@ def tokenize(pair: str,
             elif message['role'] =='system':
                 prompt += '<<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n'
             elif message['role'] == 'added_assistant':
-                prompt += " " + message['content']
+                prompt += message['content']
             elif message['role'] == 'assistant':
-                prompt += ' ' + message['content'] + tokenizer.eos_token
+                prompt += message['content'] + tokenizer.eos_token
         return prompt 
     
     prompt = pair['prompt'][0]['content'] if pair['prompt'][0]['role'] != "user" else process_message(pair['prompt'])
