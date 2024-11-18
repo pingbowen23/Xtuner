@@ -249,50 +249,8 @@ class PackedDatasetWrapper(Dataset):
         self.data = []
         
         # dataset = self.post_process(dataset)
-        # dataset_group_none , dataset_group_sorted = self.split_data(dataset)
-        # packed_dataset = self.pack_dataset(dataset_group_sorted, dataset_group_none, max_packed_length=self.max_packed_length)
-        # if dist.get_rank() == 0:
-        #     import pdb; pdb.set_trace()
-        
-        indices = np.arange(len(dataset))
-        if shuffle_before_pack:
-            np.random.shuffle(indices)
-        data_bin = []
-        bin_seq_len = 0
-        removed = 0
-                
-        for idx in indices:
-            data = dataset[int(idx)]
-            cur_len = len(data['chosen_ids']) + len(data['rejected_ids'])
-            if cur_len > max_packed_length:
-                print_log(
-                    f'sequence length {cur_len} is '
-                    f'larger than max_packed_length {max_packed_length}',
-                    logger='current')
-                removed += 1
-                continue
-            if (bin_seq_len +
-                    cur_len) > max_packed_length and len(data_bin) > 0:
-                self.data.append(data_bin)
-                self.lengths.append(bin_seq_len)
-                data_bin = []
-                bin_seq_len = 0
-            data_bin.append(data)
-            bin_seq_len += cur_len
-
-        if len(data_bin) > 0:
-            self.data.append(data_bin)
-            self.lengths.append(bin_seq_len)
-        if removed > 0:
-            print_log(
-                f'removed {removed} samples because '
-                f'of length larger than {max_packed_length}',
-                logger='current')
-        print_log(
-            f'The batch numbers of dataset is changed '
-            f'from {len(dataset)} to {len(self)} after'
-            ' using var len attention.',
-            logger='current')
+        dataset_group_none , dataset_group_sorted = self.split_data(dataset)
+        packed_dataset = self.pack_dataset(dataset_group_sorted, dataset_group_none, max_packed_length=self.max_packed_length)
 
     def split_data(self, dataset):
         # 转换为 Pandas DataFrame
@@ -313,15 +271,19 @@ class PackedDatasetWrapper(Dataset):
         
     def pack_dataset(self,dataset_group_sorted, dataset_group_none, max_packed_length=32768):
         
-        def process_group(group_id):
+        def process_group(group_id,last_index):
             data_bin = []
             bin_seq_len = 0
             removed = 0
             
-            for data in dataset_group_sorted:
+            for i in range(last_index, len(dataset_group_sorted)):
+                data = dataset_group_sorted[i]
+                if dataset_group_sorted[i]['group_id'] > group_id:
+                    break
+                
                 if data['group_id'] == group_id:
                     cur_len = len(data['chosen_ids']) + len(data['rejected_ids'])
-                    if cur_len > max_length:
+                    if cur_len > max_packed_length:
                         removed += 1
                         continue
                     
@@ -333,11 +295,26 @@ class PackedDatasetWrapper(Dataset):
                         bin_seq_len = 0
                     data_bin.append(data)
                     bin_seq_len += cur_len
+            last_index = i
+            return data_bin , bin_seq_len , last_index
+        
+        def process_short_data(data_bin, bin_seq_len, cur_index):
+            while cur_index < max_index:
+                cur_len = len(dataset_group_none[cur_index]['chosen_ids']) + len(dataset_group_none[cur_index]['rejected_ids'])
+                if cur_len > max_packed_length:
+                    continue
+                
+                if (bin_seq_len +
+                        cur_len) > max_packed_length and len(data_bin) > 0:
+                    break
+                
+                data_bin.append(dataset_group_none[cur_index])
+                bin_seq_len += cur_len
+                cur_index += 1
+            return data_bin , bin_seq_len , cur_index
             
-            return data_bin , bin_seq_len    
         
         packed = []  # 保存每次打包的结果
-        remaining_length = max_length  # 当前剩余的可用长度
 
         # 将 dataset_group_sorted 按 group_id 分组
         groups = {}
@@ -351,29 +328,37 @@ class PackedDatasetWrapper(Dataset):
         sorted_groups = list(groups.values())
 
         # 打包过程
-        groups = [0,1,2,3]
+        group_ids , last_index = sorted({data['group_id'] for data in dataset_group_sorted}), 0
+        cur_index , max_index = 0, len(dataset_group_none)
         
-        for data in dataset_group_sorted:
-            '''
-            cur_len = len(data['chosen_ids']) + len(data['rejected_ids'])
-            if cur_len > max_packed_length:
-                removed += 1
-                continue
+        for group_id in group_ids:
+            data_bin , bin_seq_len ,last_index = process_group(group_id,last_index)
             
-            if (bin_seq_len +
-                    cur_len) > max_packed_length and len(data_bin) > 0:
+            if cur_index < max_index:
+                data_bin , bin_seq_len , cur_index = process_short_data(data_bin, bin_seq_len, cur_index)
                 self.data.append(data_bin)
                 self.lengths.append(bin_seq_len)
-                data_bin = []
-                bin_seq_len = 0
-            data_bin.append(data)
-            bin_seq_len += cur_len
-            '''
-
+            else:
+                self.data.append(data_bin)
+                self.lengths.append(bin_seq_len)
+        
+        while cur_index < max_index:
+            data_bin, bin_seq_len = [], 0
+            data_bin , bin_seq_len , cur_index = process_short_data(data_bin, bin_seq_len, cur_index)
+            self.data.append(data_bin)
+            self.lengths.append(bin_seq_len)
+        
+            
         if len(data_bin) > 0:
             self.data.append(data_bin)
             self.lengths.append(bin_seq_len)
 
+        print_log(
+            f'The batch numbers of dataset is changed '
+            f'to {len(self)} after'
+            ' using var len attention.',
+            logger='current')
+        
         return packed
         
     
