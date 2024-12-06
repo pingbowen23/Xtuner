@@ -139,25 +139,36 @@ def tokenize(pair: str,
     #     pair['prompt'] + pair['rejected'],
     #     tokenize=False,
     #     add_generation_prompt=False)
-    
-    def process_message(messages):
-        prompt = ''
-        for message in messages:
-            if message['role'] == 'user':
-                prompt += '[INST]' + message['content'] + '[/INST]'
-            elif message['role'] == 'added_user':
-                prompt += message['content']
-            elif message['role'] =='system':
-                prompt += '<<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n'
-            elif message['role'] == 'added_assistant':
-                prompt += " " + message['content']
-            elif message['role'] == 'assistant':
-                prompt += ' ' + message['content'] + tokenizer.eos_token
-        return prompt 
-    
-    prompt = pair['prompt'][0]['content']
-    chosen = process_message(pair['prompt'] + pair['chosen'])
-    rejected = process_message(pair['prompt'] + pair['rejected'])
+    if tokenizer.chat_template is None:
+        def process_message(messages):
+            prompt = ''
+            for message in messages:
+                if message['role'] == 'user':
+                    prompt += '[INST]' + message['content'] + '[/INST]'
+                elif message['role'] == 'added_user':
+                    prompt += message['content']
+                elif message['role'] =='system':
+                    prompt += '<<SYS>>\\n' + message['content'] + '\\n<</SYS>>\\n\\n'
+                elif message['role'] == 'added_assistant':
+                    prompt += message['content']
+                elif message['role'] == 'assistant':
+                    prompt += message['content'] + tokenizer.eos_token
+            return prompt 
+        
+        prompt = pair['prompt'][0]['content'] if pair['prompt'][0]['role'] != "user" else process_message(pair['prompt'])
+        chosen = process_message(pair['prompt'] + pair['chosen'])
+        rejected = process_message(pair['prompt'] + pair['rejected'])
+    else:
+        prompt = tokenizer.apply_chat_template(
+            pair['prompt'], tokenize=False, add_generation_prompt=True)    
+        chosen = tokenizer.apply_chat_template(
+            pair['prompt'] + pair['chosen'],
+            tokenize=False,
+            add_generation_prompt=False)
+        rejected = tokenizer.apply_chat_template(
+            pair['prompt'] + pair['rejected'],
+            tokenize=False,
+            add_generation_prompt=False)
     
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     chosen_ids = tokenizer.encode(chosen, add_special_tokens=False)
@@ -186,9 +197,7 @@ def tokenize(pair: str,
         'chosen_ids': chosen_ids,
         'rejected_ids': rejected_ids,
         'chosen_labels': chosen_labels,
-        'rejected_labels': rejected_labels,
-        'group_id': pair.get('group_id', 0),
-        "seq_num": pair.get("seq_num", None)
+        'rejected_labels': rejected_labels
     }
 
 
@@ -229,7 +238,7 @@ class PreferenceDataset(Dataset):
                 chunksize=num_proc,
                 description='Tokenizing dataset'):
             self.tokenized_pairs.append(tokenized_pair)
-
+        
     def __len__(self):
         return len(self.tokenized_pairs)
 
@@ -247,8 +256,6 @@ class PackedDatasetWrapper(Dataset):
         self.max_packed_length = max_packed_length
         self.lengths = []
         self.data = []
-
-        dataset = self.post_process(dataset)
         
         indices = np.arange(len(dataset))
         if shuffle_before_pack:
@@ -256,7 +263,7 @@ class PackedDatasetWrapper(Dataset):
         data_bin = []
         bin_seq_len = 0
         removed = 0
-
+                
         for idx in indices:
             data = dataset[int(idx)]
             cur_len = len(data['chosen_ids']) + len(data['rejected_ids'])
@@ -289,7 +296,7 @@ class PackedDatasetWrapper(Dataset):
             f'from {len(dataset)} to {len(self)} after'
             ' using var len attention.',
             logger='current')
-
+    
     def post_process(self, dataset):
         
         def merge_data(indices, dataset):
@@ -310,7 +317,7 @@ class PackedDatasetWrapper(Dataset):
             merged_data["seq_len"] = seq_len
             merged_data["concated"] = True
             return merged_data
-        
+                
         from collections import defaultdict
         grouped_indices = defaultdict(list)
 
@@ -324,7 +331,6 @@ class PackedDatasetWrapper(Dataset):
             grouped_indices[group_id] = [index for seq_num, index in sorted(grouped_indices[group_id])]
         
         grouped_indices = dict(grouped_indices)
-        
         selected_indices = {index for indices in grouped_indices.values() for index in indices}
         merged_data = [merge_data(v, dataset) for k,v in grouped_indices.items()]
         filtered_dataset = [item for index, item in enumerate(dataset) if index not in selected_indices]
@@ -363,8 +369,6 @@ class PackedDatasetWrapper(Dataset):
                 for seq_len in seq_lens:
                     cu_seqlens.append(cu_seqlens[-1] + seq_len)
 
-            if dist.get_rank() == 0:
-                import pdb;pdb.set_trace()   
                 
         return {
             'input_ids': input_ids,
@@ -413,7 +417,6 @@ def map_dataset(dataset, dataset_map_fn, map_num_proc):
             raise TypeError('dataset_map_fn must be a function or a '
                             "registered function's string in MAP_FUNC, "
                             f"but got a string of '{dataset_map_fn}'")
-
     dataset = dataset.map(dataset_map_fn, num_proc=map_num_proc)
     return dataset
 
@@ -478,12 +481,15 @@ def intel_orca_dpo_map_fn(example):
     return {'prompt': prompt, 'chosen': chosen, 'rejected': rejected}
 
 def ultrafeedback_dpo_map_fn(example):
+    prompt_role = example.get('prompt_role') if example.get('prompt_role') is not None else "user"
+    answer_role = example.get('answer_role') if example.get('answer_role') is not None else "assistant"
+    
     prompt = [{
-        'role': example['prompt_role'],
+        'role': prompt_role,
         'content': example['instruction']
     }]
-    chosen = [{'role': example['answer_role'], 'content': example['chosen']}]
-    rejected = [{'role': example['answer_role'], 'content': example['rejected']}]
+    chosen = [{'role': answer_role, 'content': example['chosen']}]
+    rejected = [{'role': answer_role, 'content': example['rejected']}]
     return {'prompt': prompt, 'chosen': chosen, 'rejected': rejected}
 
 def orpo_dpo_mix_40k_map_fn(example):
